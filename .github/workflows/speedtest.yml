@@ -1,0 +1,60 @@
+name: Auto Cloudflare SpeedTest
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 每天凌晨4点运行 (UTC时间)
+  workflow_dispatch:      # 允许手动点按钮运行
+
+jobs:
+  run-speedtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install & Run SpeedTest
+        run: |
+          # 下载测速工具
+          mkdir -p CloudflareST
+          cd CloudflareST
+          wget -N https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
+          tar -zxf CloudflareST_linux_amd64.tar.gz
+          chmod +x CloudflareST
+          
+          # 开始测速 (只测美国 IP, 端口 443)
+          echo "Start SpeedTest..."
+          ./CloudflareST -t 5 -tl 250 -dn 3 -tp 443 -f ip.txt -o result.csv
+          
+          # 提取最快的一个 IP
+          BEST_IP=$(sed -n '2p' result.csv | cut -d, -f1)
+          echo "Found Best IP: $BEST_IP"
+          echo "BEST_IP=$BEST_IP" >> $GITHUB_ENV
+
+      - name: Update DNS Record
+        env:
+          # 引用我们在 Settings 里填的秘密
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_DNS_NAME: ${{ secrets.CF_DNS_NAME }}
+        run: |
+          # 获取域名当前的 DNS 记录 ID
+          RECORD_INFO=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$CF_DNS_NAME" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")
+          
+          RECORD_ID=$(echo $RECORD_INFO | jq -r '.result[0].id')
+          
+          # 如果找不到记录，提示错误
+          if [ "$RECORD_ID" == "null" ] || [ -z "$RECORD_ID" ]; then
+            echo "Error: 找不到域名的记录 ID，请先在 Cloudflare 手动创建一个 A 记录 (比如 best.你的域名.com 指向 1.1.1.1)"
+            exit 1
+          fi
+
+          # 更新 IP
+          echo "Updating DNS record $CF_DNS_NAME to $BEST_IP..."
+          UPDATE_RESULT=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$RECORD_ID" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"$CF_DNS_NAME\",\"content\":\"$BEST_IP\",\"ttl\":60,\"proxied\":false}")
+            
+          echo "Update Success!"
