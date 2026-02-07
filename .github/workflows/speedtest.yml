@@ -1,60 +1,95 @@
-name: Auto Cloudflare SpeedTest
+name: Auto Cloudflare SpeedTest (Telecom Optimized)
 
 on:
   schedule:
-    - cron: '0 4 * * *'  # 每天凌晨4点运行 (UTC时间)
-  workflow_dispatch:      # 允许手动点按钮运行
+    # 每天北京时间中午 12:00 运行 (UTC时间 4:00)
+    # 你可以根据需要修改，比如 '0 21 * * *' 是北京时间凌晨5点
+    - cron: '0 4 * * *'
+  workflow_dispatch:      # 允许你在 Actions 页面手动点击按钮立即运行
 
 jobs:
-  run-speedtest:
+  update-dns:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Install & Run SpeedTest
+      - name: Fetch Best IP
         run: |
-          # 下载测速工具
-          mkdir -p CloudflareST
-          cd CloudflareST
-          wget -N https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
-          tar -zxf CloudflareST_linux_amd64.tar.gz
-          chmod +x CloudflareST
+          # ---------------------------------------------------------------------
+          # 核心步骤：获取优选 IP
+          # 使用 ymyuuu/IPDB 的 bestproxy.txt，这是一个维护很勤快的高质量 IP 列表
+          # ---------------------------------------------------------------------
+          IP_LIST_URL="https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestproxy.txt"
           
-          # 开始测速 (只测美国 IP, 端口 443)
-          echo "Start SpeedTest..."
-          ./CloudflareST -t 5 -tl 250 -dn 3 -tp 443 -f ip.txt -o result.csv
+          echo "正在从 $IP_LIST_URL 下载 IP 列表..."
+          wget -q -O all_ips.txt $IP_LIST_URL
           
-          # 提取最快的一个 IP
-          BEST_IP=$(sed -n '2p' result.csv | cut -d, -f1)
-          echo "Found Best IP: $BEST_IP"
+          # 检查文件是否下载成功且不为空
+          if [ ! -s all_ips.txt ]; then
+            echo "Error: 下载 IP 列表失败或文件为空"
+            exit 1
+          fi
+
+          # ---------------------------------------------------------------------
+          # 提取逻辑：
+          # 1. grep: 确保只提取 IPv4 地址 (排除 IPv6 或干扰行)
+          # 2. head -n 20: 取列表里测速最快的前 20 个 IP
+          # 3. shuf -n 1:  从中随机选 1 个 (避免死盯着第1名薅，防止被封)
+          # 4. cut -d: -f1: 去掉端口号 (例如 1.2.3.4:443 -> 1.2.3.4)
+          # ---------------------------------------------------------------------
+          BEST_IP=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' all_ips.txt | head -n 20 | shuf -n 1 | cut -d: -f1)
+          
+          if [ -z "$BEST_IP" ]; then
+             echo "Error: 未能提取到有效 IP，请检查列表源"
+             exit 1
+          fi
+          
+          echo "🎉 成功选定优选 IP: $BEST_IP"
+          # 将结果写入环境变量，供下一步骤使用
           echo "BEST_IP=$BEST_IP" >> $GITHUB_ENV
 
       - name: Update DNS Record
         env:
-          # 引用我们在 Settings 里填的秘密
+          # 这里的 secrets 必须和你在 GitHub Settings 里设置的变量名保持一致
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_DNS_NAME: ${{ secrets.CF_DNS_NAME }}
         run: |
-          # 获取域名当前的 DNS 记录 ID
+          # ---------------------------------------------------------------------
+          # 调用 Cloudflare API 更新域名解析
+          # ---------------------------------------------------------------------
+          
+          # 1. 获取域名当前的 DNS 记录 ID
           RECORD_INFO=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?name=$CF_DNS_NAME" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json")
           
+          # 提取 ID
           RECORD_ID=$(echo $RECORD_INFO | jq -r '.result[0].id')
           
-          # 如果找不到记录，提示错误
+          # 如果找不到记录，提示错误并停止
           if [ "$RECORD_ID" == "null" ] || [ -z "$RECORD_ID" ]; then
-            echo "Error: 找不到域名的记录 ID，请先在 Cloudflare 手动创建一个 A 记录 (比如 best.你的域名.com 指向 1.1.1.1)"
+            echo "❌ Error: 找不到域名的记录 ID。"
+            echo "请先在 Cloudflare 控制台手动创建一个 A 记录 (例如: best.你的域名.com 指向 1.1.1.1)，然后再运行此脚本。"
             exit 1
           fi
 
-          # 更新 IP
-          echo "Updating DNS record $CF_DNS_NAME to $BEST_IP..."
+          # 2. 更新 IP 地址
+          echo "正在更新 DNS 记录: $CF_DNS_NAME -> $BEST_IP ..."
+          
           UPDATE_RESULT=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$RECORD_ID" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
             --data "{\"type\":\"A\",\"name\":\"$CF_DNS_NAME\",\"content\":\"$BEST_IP\",\"ttl\":60,\"proxied\":false}")
-            
-          echo "Update Success!"
+          
+          # 检查更新结果
+          SUCCESS=$(echo $UPDATE_RESULT | jq -r '.success')
+          
+          if [ "$SUCCESS" == "true" ]; then
+            echo "✅ 更新成功！当前域名已指向: $BEST_IP"
+          else
+            echo "❌ 更新失败，Cloudflare 返回信息如下："
+            echo $UPDATE_RESULT
+            exit 1
+          fi
